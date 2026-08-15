@@ -9,7 +9,7 @@ description: 把 DeepSeek Harness（DSH）Web GUI 封装成 Tauri 2 桌面应用
 
 - **品牌名「小南梁」**：来由——「南」取梁总（DeepSeek 创始人梁文锋，广东湛江人，
   南方人）的南方之义，「梁」取其姓氏；配合鲸鱼娘封面（DeepSeek 官方鲸鱼的娘化
-  OC「溟月」，深海女仆工坊 maid-atelier），命名另有圈内谐音彩蛋。
+  OC「溟月」，深海女仆工坊 maid-atelier）。
 - **技术标识一律 ASCII**：skill 名、目录名、Cargo.toml 的 name、二进制名、bundle
   identifier 使用 `dsh-desktop-app` / `dsh-desktop` / `com.arcreel.dsh-desktop`。
   中文「小南梁」只用于展示层：productName、窗口 title、托盘 tooltip、通知文案、

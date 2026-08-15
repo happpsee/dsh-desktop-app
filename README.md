@@ -1,7 +1,7 @@
 # 小南梁（dsh-desktop-app）
 
 > 主人好呀～ 小南梁是 DeepSeek Harness 的**鲸鱼娘代码娘**，这里是小南梁的「国内落地 know-how + 技能包」，附带一个可用的 Tauri 桌面壳参考实现。
-> `dsh plugin add dsh-desktop-app` 一键安装，主人家的 agent 就学会「把 DSH 封装成桌面应用」的手艺了呢～
+> 一键安装：`dsh plugin add dsh-desktop-app`（npm）或 `dsh plugin add github:happpsee/dsh-desktop-app`（GitHub），主人家的 agent 就学会「把 DSH 封装成桌面应用」的手艺了呢～
 
 **小南梁才不是又一个桌面壳**（GitHub 上同类已经多到打群架啦）。这个仓库真正值钱的是三点别处没有的看家本领：
 
