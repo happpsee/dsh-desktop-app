@@ -20,8 +20,9 @@
 
 ## 生态化（可选方向）
 
-- [ ] **dsh.bundle 化改造**：把 skill 包成 `dsh plugin add` 可安装的 bundle
-      （需研究 DSH 的 skill 注册协议），合规进入 awesome-dsh-plugin / dsh-market
+- [x] **dsh.bundle 化改造**：已做成 `dsh plugin add` 可安装的 bundle（index.js +
+      cordis.patch.yml + package.json dsh.bundle），npm 发布 0.3.0，awesome-dsh-plugin
+      收录（PR #695 已合并，dsh-market 自动聚合）
 - [ ] **中文技术社区文章**：《把 DeepSeek Harness 包成桌面应用》实操文
       （掘金/知乎/B 站），挂仓库链接
 - [x] **图像理解接入**：dsh-vision-router 插件已安装并验证（页面注入 ✓，视觉工具
