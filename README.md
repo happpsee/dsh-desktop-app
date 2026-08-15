@@ -1,7 +1,7 @@
 # 小南梁（dsh-desktop-app）
 
 > DeepSeek Harness 的**国内落地 know-how + 技能包**，附带一个可用的 Tauri 桌面壳参考实现。
-> `dsh plugin add dsh-desktop-app` 一键安装，让你的 agent 掌握「把 DSH 封装成桌面应用」的完整方法。
+> `dsh plugin add github:happpsee/dsh-desktop-app` 一键安装，让你的 agent 掌握「把 DSH 封装成桌面应用」的完整方法。
 
 **这不是又一个桌面壳**（GitHub 上同类已有几十个）。这个仓库的价值在三点别处没有的东西：
 
