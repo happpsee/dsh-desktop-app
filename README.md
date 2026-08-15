@@ -1,11 +1,15 @@
 # 小南梁（dsh-desktop-app）
 
-> DeepSeek Harness 的鲸鱼娘桌面壳 —— 双击即用，托盘常驻，上下文不丢。
+> DeepSeek Harness 的**国内落地 know-how + 技能包**，附带一个可用的 Tauri 桌面壳参考实现。
+> `dsh plugin add dsh-desktop-app` 一键安装，让你的 agent 掌握「把 DSH 封装成桌面应用」的完整方法。
 
-把 DeepSeek Harness（DSH）的 Web GUI 封装成 **Tauri 2** 桌面应用，macOS 与
-Windows 双平台。11MB 体积（Electron 方案的十分之一），启动即拉起本地
-`dsh web` 服务，窗口内就是完整的 DSH：**同一份会话存储，浏览器与桌面端
-无缝衔接**。
+**这不是又一个桌面壳**（GitHub 上同类已有几十个）。这个仓库的价值在三点别处没有的东西：
+
+1. **Windows 无管理员工具链方案**：无 VS Build Tools 也能构建 Tauri 2（xwin + rust-lld + clang-cl + 真 rc.exe），全部用户级安装，附配置模板与脚本
+2. **国内镜像哨兵机制**：rustup/cargo/npm/GitHub/NSIS 全套镜像 + subagent 超时判定，Windows 新环境不再卡外网
+3. **真机实测审计报告**：Win11 无管理员逐条实测 + 20 条修订清单（docs/）
+
+桌面壳本身（`desktop/`，macOS + Windows 双平台，托盘常驻 / 单实例 / 子进程回收 / 品牌注入 / 任务完成通知）作为这套 know-how 的**可运行参考实现**。
 
 ## 名字的来由
 

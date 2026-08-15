@@ -1,0 +1,32 @@
+{
+  "name": "dsh-desktop-app",
+  "version": "0.3.0",
+  "description": "DSH 桌面壳「小南梁」技能包：把 DeepSeek Harness 封装成 Tauri 2 桌面应用（macOS+Windows），含国内镜像加速、Windows 无管理员工具链、验收清单",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/happpsee/dsh-desktop-app.git"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "desktop",
+    "tauri",
+    "skill",
+    "china-mirror",
+    "windows"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
