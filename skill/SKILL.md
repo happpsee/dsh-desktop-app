@@ -237,7 +237,9 @@ curl -sL -o whale-girl-v1.png \
   https://aka.ms/vs/17/release/vs_BuildTools.exe 安装时勾选"使用 C++ 的桌面开发"；
   或 `winget install Microsoft.VisualStudio.2022.BuildTools --override "--add Microsoft.VisualStudio.Workload.VCTools"`。
   **无管理员权限时以上皆不可用**（实测环境即此形态），完整替代方案（全部用户级、
-  实测构建+打包通过）见 resources/windows-build-notes.md §2：xwin 取 CRT/SDK 头库
+  实测构建+打包通过）见 resources/windows-build-notes.md §2，配置模板直接取
+  `desktop/scripts/cargo-config-no-admin.toml.example`，环境变量由
+  `desktop/scripts/build-env.ps1` 加载：xwin 取 CRT/SDK 头库
   （splat 无符号链接特权报 os error 1314 可忽略）+ rustup 自带 rust-lld 作链接器 +
   LLVM 安装器用 7-Zip 解压出 clang-cl（免 UAC）+ NuGet Microsoft.Windows.SDK.BuildTools
   取**真 rc.exe**（llvm-rc 编不了 `#pragma code_page(65001)` 中文资源，必失败），
@@ -335,6 +337,12 @@ by 上善无形、二创 ZipZipPipe、修复 QYQCAMIAO）与许可，保留 LICE
 公开分发前评估 CC 非商用 + DeepSeek 商标问题。
 
 ## 六、构建与验收（两条路径必须绿）
+
+仓库 `desktop/scripts/` 已提供现成脚本：`acceptance.sh`（macOS）/
+`acceptance.ps1`（Windows）自动跑 A/B/C 三路径；`build-env.ps1` +
+`cargo-config-no-admin.toml.example` 固化 Windows 无管理员构建环境。
+**运行验收前必须退出所有 dsh-desktop 实例**：单实例锁会把验收进程静默转交
+并立即退出（exit 0 但零输出，造成假通过），脚本开头已内置该检测。
 
 ```bash
 cd desktop && pnpm tauri build   # mac 出 .app/.dmg，win 出 .msi/-setup.exe

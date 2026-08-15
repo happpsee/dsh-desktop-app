@@ -1,0 +1,22 @@
+# 小南梁 · Windows 无管理员工具链 cargo 配置模板
+# 实测环境：Win11 无管理员权限、无 VS Build Tools、国内网络
+# 来源：docs/windows-build-notes.md §2 —— 全部组件用户级安装
+#
+# 组件清单：
+#   xwin    → 取 MSVC CRT + Windows SDK 头/库（~/.xwin，splat 报 os error 1314 可忽略）
+#   rust-lld → rustup 自带链接器（不装 VS 也能链 MSVC 目标）
+#   clang-cl → LLVM 安装器用 7-Zip 解压免 UAC（CC/CXX 需要 C++ 编译器：vswhom-sys 链）
+#   rc.exe  → NuGet Microsoft.Windows.SDK.BuildTools 里的微软真 rc.exe
+#             （llvm-rc 编不了 #pragma code_page(65001) 中文资源；rcdll.dll 需同目录）
+#
+# 用法：把下方占位路径替换为本机实际路径，合并进 ~/.cargo/config.toml
+
+[env]
+INCLUDE = "<xwin>/crt/include;<xwin>/sdk/include/ucrt;<xwin>/sdk/include/um;<xwin>/sdk/include/shared;<xwin>/sdk/include/winrt"
+LIB     = "<xwin>/crt/lib/x86_64;<xwin>/sdk/lib/ucrt/x86_64;<xwin>/sdk/lib/um/x86_64"
+CC      = "<llvm>/bin/clang-cl.exe"
+CXX     = "<llvm>/bin/clang-cl.exe"
+RC      = "<tools>/rc.exe"
+
+[target.x86_64-pc-windows-msvc]
+linker  = "<rustup>/toolchains/stable-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
