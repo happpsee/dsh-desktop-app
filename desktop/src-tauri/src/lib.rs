@@ -12,7 +12,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Mutex,
     },
     thread,
@@ -83,6 +83,8 @@ struct DshState {
     quitting: AtomicBool,
     /// 是否已提示过"隐藏到托盘"。
     tray_tip_shown: AtomicBool,
+    /// 未读任务完成数（Dock 角标）。
+    unread: AtomicU32,
 }
 
 /// 定位 dsh 可执行文件。
@@ -190,6 +192,8 @@ fn dsh_runtime_path(bin: &std::path::Path) -> std::ffi::OsString {
         paths.push(PathBuf::from(p));
     }
     paths.push(PathBuf::from(&home).join(".npm-global/bin"));
+    // rustup 的 cargo/rustc：终端启动的 dsh 有，GUI 启动的 dsh 子进程没有
+    paths.push(PathBuf::from(&home).join(".cargo/bin"));
     if let Some(existing) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&existing));
     }
@@ -429,6 +433,168 @@ fn inject_brand(app: AppHandle) {
     });
 }
 
+/// 生成本地通知服务器的访问 token（防本机其它进程误触发；非加密学强度）。
+fn random_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("xnl{:x}{:x}", nanos, std::process::id())
+}
+
+/// 启动本地 HTTP 通知服务器（127.0.0.1 随机端口），返回 (端口, token)。
+/// 页面注入 JS 通过 POST /notify 上报任务完成。
+fn start_notify_server(app: AppHandle) -> (u16, String) {
+    let token = random_token();
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("通知服务器启动失败：{e}");
+            return (0, token);
+        }
+    };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    listener.set_nonblocking(true).ok();
+    let handle = app.clone();
+    let tok = token.clone();
+    tauri::async_runtime::spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(listener) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            let handle = handle.clone();
+            let tok = tok.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_notify_conn(&mut sock, &handle, &tok).await;
+            });
+        }
+    });
+    log::info!("任务完成通知服务器已启动：127.0.0.1:{port}");
+    (port, token)
+}
+
+/// 处理单条通知连接：校验 Bearer token，解析 JSON body，触发通知。
+async fn handle_notify_conn(sock: &mut tokio::net::TcpStream, app: &AppHandle, token: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 4096];
+    let n = match sock.read(&mut buf).await {
+        Ok(n) if n > 0 => n,
+        _ => return,
+    };
+    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+    if !req.contains(&format!("Bearer {token}")) {
+        let _ = sock
+            .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+    let body = req.split("\r\n\r\n").nth(1).unwrap_or("").trim().to_string();
+    let mut msg = "任务已完成".to_string();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
+        if let Some(s) = v.get("body").and_then(|x| x.as_str()) {
+            msg = s.to_string();
+        }
+    }
+    notify_completed(app, &msg);
+    let _ = sock
+        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        .await;
+}
+
+/// 收到任务完成信号后的壳侧动作：Dock 角标 +1；仅窗口失焦/隐藏时弹通知并跳 Dock。
+fn notify_completed(app: &AppHandle, body: &str) {
+    let distracted = app
+        .get_webview_window("main")
+        .map(|w| {
+            let focused = w.is_focused().unwrap_or(true);
+            let visible = w.is_visible().unwrap_or(true);
+            !focused || !visible
+        })
+        .unwrap_or(true);
+    let state = app.state::<DshState>();
+    let unread = state.unread.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.set_badge_count(Some(unread as i64));
+        if distracted {
+            let _ = app
+                .notification()
+                .builder()
+                .title("小南梁 · 任务完成")
+                .body(body)
+                .show();
+            let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        }
+    }
+    log::info!("任务完成通知：{}（未读 {unread}，失焦={distracted}）", body);
+}
+
+/// 生成页面侧任务完成监听脚本：轮询"忙碌→空闲"翻转，翻转即上报。
+fn task_notifier_script(port: u16, token: &str) -> String {
+    let js = r#"
+(function(){
+  if (window.__xnlNotify) return;
+  window.__xnlNotify = true;
+  var PORT = __PORT__, TOKEN = "__TOKEN__";
+  var wasBusy = false, lastFire = 0;
+  function isBusy(){
+    try {
+      var els = document.querySelectorAll('button,[role="button"]');
+      for (var i=0;i<els.length;i++){
+        var t = (els[i].textContent||'').replace(/\s+/g,'');
+        if (t.indexOf('停止')===0 || /^stop/i.test(t)) return true;
+      }
+      if (document.querySelector('[aria-busy="true"]')) return true;
+    } catch(e){}
+    return false;
+  }
+  function fire(){
+    var now = Date.now();
+    if (now - lastFire < 3000) return;
+    lastFire = now;
+    try {
+      fetch('http://127.0.0.1:'+PORT+'/notify', {
+        method:'POST',
+        headers:{'Content-Type':'application/json','Authorization':'Bearer '+TOKEN},
+        body: JSON.stringify({type:'task-complete', body:'任务已完成，回来看看吧'})
+      });
+    } catch(e){}
+  }
+  setInterval(function(){
+    var b = isBusy();
+    if (wasBusy && !b) fire();
+    wasBusy = b;
+  }, 1000);
+})();
+"#;
+    js.replace("__PORT__", &port.to_string())
+        .replace("__TOKEN__", token)
+}
+
+/// 导航完成后注入任务完成监听（脚本自带守卫，重复注入无害）。
+fn inject_task_notifier(app: AppHandle, port: u16, token: &str) {
+    if port == 0 {
+        return;
+    }
+    let handle = app.clone();
+    let script = task_notifier_script(port, token);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        if let Some(w) = handle.get_webview_window("main") {
+            if let Err(e) = w.eval(&script) {
+                log::warn!("任务完成监听注入失败：{e}");
+            } else {
+                log::info!("任务完成监听已注入（忙碌→空闲检测）");
+            }
+        }
+    });
+}
+
 /// 轮询等待服务就绪，然后把主窗口导航到 Web GUI；失败则跳错误页。
 async fn wait_ready_and_navigate(app: AppHandle, port: u16) {
     let state = app.state::<DshState>();
@@ -551,6 +717,7 @@ pub fn run() {
             spawn_failed: AtomicBool::new(false),
             quitting: AtomicBool::new(false),
             tray_tip_shown: AtomicBool::new(false),
+            unread: AtomicU32::new(0),
         })
         .setup(|app| {
             let port = app_port();
@@ -593,6 +760,16 @@ pub fn run() {
                     handle.exit(0);
                 });
             }
+            // 测试钩子：DSH_DESKTOP_NOTIFY_TEST=1 时延迟触发一次通知（验证通知链路）
+            if std::env::var("DSH_DESKTOP_NOTIFY_TEST").as_deref() == Ok("1") {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(6)).await;
+                    notify_completed(&handle, "这是测试通知：任务完成链路验证");
+                });
+            }
+            let (nport, ntoken) = start_notify_server(app.handle().clone());
+            inject_task_notifier(app.handle().clone(), nport, &ntoken);
             build_tray(app)?;
             Ok(())
         })
@@ -616,6 +793,11 @@ pub fn run() {
                         .body("窗口已隐藏到菜单栏托盘，点击托盘图标可重新打开；托盘菜单可退出。")
                         .show();
                 }
+            } else if let WindowEvent::Focused(true) = event {
+                // 用户回到窗口：清零角标与未读数
+                let state = window.state::<DshState>();
+                state.unread.store(0, Ordering::SeqCst);
+                let _ = window.set_badge_count(None);
             }
         })
         .build(tauri::generate_context!())

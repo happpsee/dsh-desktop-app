@@ -14,8 +14,8 @@
 
 - [ ] **品牌注入刷新丢失**：窗口内 Cmd+R 刷新后样式还原，需 webview on_navigation
       钩子自动重注入
-- [ ] **Web GUI 任务完成通知**：接入桌面通知通道（tauri-plugin-notification 已有，
-      缺页面侧 IPC 桥）
+- [x] **Web GUI 任务完成通知**：本地 HTTP 桥 + busy→idle 检测 + Dock 角标/跳动
+      （0.3.0 实现；端到端实测待用户退出实例后验证）
 - [ ] **托盘点击验收**（Windows 无头环境未实测）：需要真机手工确认
 
 ## 生态化（可选方向）
@@ -24,5 +24,5 @@
       （需研究 DSH 的 skill 注册协议），合规进入 awesome-dsh-plugin / dsh-market
 - [ ] **中文技术社区文章**：《把 DeepSeek Harness 包成桌面应用》实操文
       （掘金/知乎/B 站），挂仓库链接
-- [ ] **图像理解接入**：见 #讨论-图像理解，方案敲定后落地（视觉工具代理 /
-      DeepSeek VL API / 本地视觉模型三选一）
+- [x] **图像理解接入**：dsh-vision-router 插件已安装并验证（页面注入 ✓，视觉工具
+      已挂载，OVH 免费链 + 可选自有视觉模型）
