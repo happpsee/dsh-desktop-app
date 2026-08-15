@@ -1,0 +1,647 @@
+//! DeepSeek Harness 桌面壳核心逻辑。
+//!
+//! 职责：
+//! 1. 启动时探测本地 dsh 服务（默认 127.0.0.1:3080），空闲则 spawn `dsh web` 子进程；
+//! 2. 轮询服务就绪后把主窗口从 loading 页导航到 Web GUI；
+//! 3. 托盘常驻：关闭窗口仅隐藏，托盘菜单可显示/退出；
+//! 4. 应用退出时回收本次启动的子进程，复用已有实例时不动它。
+
+use std::{
+    io::{BufRead, BufReader},
+    net::{SocketAddr, TcpStream},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, RunEvent, WindowEvent,
+};
+use tauri_plugin_log::{Target, TargetKind};
+use tauri_plugin_notification::NotificationExt;
+
+/// 桌面壳与 dsh 服务的约定端口（可用 `DSH_DESKTOP_PORT` 覆盖，调试用）。
+fn app_port() -> u16 {
+    std::env::var("DSH_DESKTOP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3080)
+}
+
+/// 等待服务就绪的超时时间。
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 从 nvm 版本目录名（如 v22.12.0）解析可比较的版本键；无法解析的返回 (0,0,0)。
+/// 注意：目录名必须按 semver 比较排序，字符串排序会把 v9.11.0 排在 v22.12.0 之后。
+fn version_key(path: &std::path::Path) -> (u64, u64, u64) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parts: Vec<u64> = name
+        .trim_start_matches('v')
+        .split('.')
+        .map(|p| p.parse().unwrap_or(0))
+        .collect();
+    (
+        parts.first().copied().unwrap_or(0),
+        parts.get(1).copied().unwrap_or(0),
+        parts.get(2).copied().unwrap_or(0),
+    )
+}
+
+/// spawn dsh 的失败原因：NotFound 供错误页提示"未找到"，其余归为其它失败。
+enum SpawnError {
+    NotFound(String),
+    Other(String),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpawnError::NotFound(m) | SpawnError::Other(m) => f.write_str(m),
+        }
+    }
+}
+
+/// 桌面壳的共享运行时状态。
+struct DshState {
+    /// 本次运行 spawn 的 dsh 子进程（None = 复用了已有实例）。
+    child: Mutex<Option<Child>>,
+    /// 子进程是否由本次运行启动（决定退出时是否回收）。
+    spawned_this_run: AtomicBool,
+    /// spawn 失败标志（立即终止等待并跳错误页）。
+    spawn_failed: AtomicBool,
+    /// 托盘"退出"标志（置位后放行窗口关闭与应用退出）。
+    quitting: AtomicBool,
+    /// 是否已提示过"隐藏到托盘"。
+    tray_tip_shown: AtomicBool,
+}
+
+/// 定位 dsh 可执行文件。
+///
+/// Finder 启动的 GUI 应用 PATH 里没有终端配置（nvm bin、npm 全局 bin 都不在），
+/// 所以除 PATH 外还要探测常见安装位置。
+#[cfg(unix)]
+fn find_dsh_bin() -> Option<PathBuf> {
+    // 1. 显式覆盖：DSH_BIN 环境变量
+    if let Ok(p) = std::env::var("DSH_BIN") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            log::info!("使用 DSH_BIN 指定的 dsh：{}", pb.display());
+            return Some(pb);
+        }
+        log::warn!("DSH_BIN 指向的文件不存在：{}", pb.display());
+    }
+    // 2. PATH（终端启动 / tauri dev 场景）
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let pb = dir.join("dsh");
+            if pb.is_file() {
+                log::info!("在 PATH 中找到 dsh：{}", pb.display());
+                return Some(pb);
+            }
+        }
+    }
+    // 3. 常见安装位置
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut candidates: Vec<PathBuf> = vec![
+        PathBuf::from("/opt/homebrew/bin/dsh"),
+        PathBuf::from("/usr/local/bin/dsh"),
+        PathBuf::from(&home).join(".npm-global/bin/dsh"),
+    ];
+    // 3a. nvm 管理的 node（按 semver 取版本号最高的目录）
+    let nvm_root = PathBuf::from(&home).join(".nvm/versions/node");
+    if let Ok(entries) = std::fs::read_dir(&nvm_root) {
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort_by_key(|d| version_key(d));
+        for d in dirs.iter().rev() {
+            candidates.push(d.join("bin/dsh"));
+        }
+    }
+    // 3b. npx 缓存（取修改时间最新的目录，防缓存漂移）
+    let npx_root = PathBuf::from(&home).join(".npm/_npx");
+    if let Ok(entries) = std::fs::read_dir(&npx_root) {
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort_by_key(|p| p.metadata().and_then(|m| m.modified()).ok());
+        for d in dirs.iter().rev() {
+            candidates.push(d.join("node_modules/.bin/dsh"));
+        }
+    }
+    candidates.into_iter().find(|p| {
+        if p.is_file() {
+            log::info!("找到 dsh：{}", p.display());
+            true
+        } else {
+            false
+        }
+    })
+}
+
+/// 探测 127.0.0.1:port 是否已有服务在监听。
+fn port_open(port: u16) -> bool {
+    TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(300),
+    )
+    .is_ok()
+}
+
+/// 构造 spawn dsh 时的运行时 PATH。
+///
+/// Finder 启动的 GUI 应用 PATH 只有 `/usr/bin:/bin`，而 dsh 是 Node 脚本
+/// （shebang 依赖 `node`）。把 dsh 所在目录、nvm 各版本 bin、Homebrew 等
+/// 候选目录补充到子进程 PATH 前面。
+#[cfg(unix)]
+fn dsh_runtime_path(bin: &std::path::Path) -> std::ffi::OsString {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = bin.parent() {
+        paths.push(parent.to_path_buf());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let nvm_root = PathBuf::from(&home).join(".nvm/versions/node");
+    if let Ok(entries) = std::fs::read_dir(&nvm_root) {
+        let mut dirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort_by_key(|d| version_key(d));
+        for d in dirs.iter().rev() {
+            paths.push(d.join("bin"));
+        }
+    }
+    for p in ["/opt/homebrew/bin", "/usr/local/bin"] {
+        paths.push(PathBuf::from(p));
+    }
+    paths.push(PathBuf::from(&home).join(".npm-global/bin"));
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| std::ffi::OsString::from("/usr/bin:/bin"))
+}
+
+/// spawn `dsh web --host 127.0.0.1 --port <port>`，stdout/stderr 转发到日志。
+#[cfg(unix)]
+fn spawn_dsh(port: u16) -> Result<Child, SpawnError> {
+    let bin = find_dsh_bin().ok_or_else(|| {
+        SpawnError::NotFound(
+            "未找到 dsh 命令。请执行 `npm i -g @deepseek-ai/dsh` 或设置 DSH_BIN 环境变量。"
+                .to_string(),
+        )
+    })?;
+    let mut cmd = Command::new(&bin);
+    cmd.args(["web", "--host", "127.0.0.1", "--port", &port.to_string()])
+        .env("PATH", dsh_runtime_path(&bin))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| SpawnError::Other(format!("spawn {} 失败：{e}", bin.display())))?;
+    log::info!("已启动 dsh web（{}，PID {}）", bin.display(), child.id());
+    if let Some(out) = child.stdout.take() {
+        thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                log::info!("[dsh] {line}");
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                log::warn!("[dsh] {line}");
+            }
+        });
+    }
+    Ok(child)
+}
+
+// ==================== Windows 分支 ====================
+// 注意：以下代码只在 Windows 上编译（macOS 构建时被 cfg 完全排除），
+// 已在 macOS 之外无法本机验证；若 Windows 编译报错，按编译器提示修正。
+
+/// Windows：定位 node.exe（nvm-windows / 官方安装器 / PATH）。
+#[cfg(windows)]
+fn find_node() -> Option<PathBuf> {
+    // ① 显式覆盖：DSH_NODE
+    if let Ok(p) = std::env::var("DSH_NODE") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    // ② PATH 中的 node.exe
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let pb = dir.join("node.exe");
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+    }
+    // ③ nvm-windows：%NVM_HOME%\v*\node.exe、%NVM_SYMLINK%\node.exe、%APPDATA%\nvm\v*
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let mut nvm_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(h) = std::env::var("NVM_HOME") {
+        nvm_roots.push(PathBuf::from(h));
+    }
+    if let Ok(a) = std::env::var("APPDATA") {
+        nvm_roots.push(PathBuf::from(&a).join("nvm"));
+    }
+    for root in &nvm_roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            let mut dirs: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect();
+            dirs.sort_by_key(|d| version_key(d));
+            for d in dirs.iter().rev() {
+                candidates.push(d.join("node.exe"));
+            }
+        }
+        candidates.push(root.join("node.exe"));
+    }
+    if let Ok(s) = std::env::var("NVM_SYMLINK") {
+        candidates.push(PathBuf::from(s).join("node.exe"));
+    }
+    // ④ 官方安装器固定路径
+    for p in [
+        r"C:\Program Files\nodejs\node.exe",
+        r"C:\Program Files (x86)\nodejs\node.exe",
+    ] {
+        candidates.push(PathBuf::from(p));
+    }
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+/// Windows：定位 dsh 的 bin.js（npm/nvm/pnpm 全局安装位置）。
+/// 支持 DSH_BIN 直接指向 bin.js 或任意可执行文件。
+#[cfg(windows)]
+fn find_dsh_bin_js() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("DSH_BIN") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    const REL: &str = "node_modules\\@deepseek-ai\\dsh\\lib\\bin.js";
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(a) = std::env::var("APPDATA") {
+        roots.push(PathBuf::from(&a).join("npm"));
+        roots.push(PathBuf::from(&a).join("pnpm"));
+        let nvm_dir = PathBuf::from(&a).join("nvm");
+        roots.push(nvm_dir.clone());
+        // nvm 各版本目录（node_modules 可能装在版本目录下）
+        if let Ok(entries) = std::fs::read_dir(&nvm_dir) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    roots.push(e.path());
+                }
+            }
+        }
+    }
+    if let Ok(l) = std::env::var("LOCALAPPDATA") {
+        roots.push(PathBuf::from(&l).join("pnpm"));
+    }
+    if let Ok(h) = std::env::var("NVM_HOME") {
+        roots.push(PathBuf::from(&h));
+        if let Ok(entries) = std::fs::read_dir(&h) {
+            for e in entries.flatten() {
+                if e.path().is_dir() {
+                    roots.push(e.path());
+                }
+            }
+        }
+    }
+    if let Ok(s) = std::env::var("NVM_SYMLINK") {
+        roots.push(PathBuf::from(s));
+    }
+    roots.push(PathBuf::from(r"C:\Program Files\nodejs"));
+    roots.push(PathBuf::from(r"C:\Program Files (x86)\nodejs"));
+    // PATH 目录（dsh.cmd 所在目录一般就是全局 bin，node_modules 在附近）
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            roots.push(dir);
+        }
+    }
+    roots
+        .into_iter()
+        .map(|root| root.join(REL))
+        .find(|p| p.is_file())
+}
+
+/// Windows：spawn `node <bin.js> web ...`。
+///
+/// npm 全局安装的 dsh 在 Windows 是 dsh.cmd shim，直接 CreateProcess 有引号
+/// 转义坑，所以直接用 node.exe 执行 bin.js；CREATE_NO_WINDOW 防止闪黑窗。
+#[cfg(windows)]
+fn spawn_dsh(port: u16) -> Result<Child, SpawnError> {
+    use std::os::windows::process::CommandExt;
+    let node = find_node().ok_or_else(|| {
+        SpawnError::NotFound(
+            "未找到 node.exe。请安装 Node.js 或设置 DSH_NODE 环境变量。".to_string(),
+        )
+    })?;
+    let bin_js = find_dsh_bin_js().ok_or_else(|| {
+        SpawnError::NotFound(
+            "未找到 @deepseek-ai/dsh。请执行 `npm i -g @deepseek-ai/dsh`，或设置 DSH_BIN 指向 bin.js。"
+                .to_string(),
+        )
+    })?;
+    let mut cmd = Command::new(&node);
+    cmd.arg(&bin_js)
+        .args(["web", "--host", "127.0.0.1", "--port", &port.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| SpawnError::Other(format!("spawn node {} 失败：{e}", node.display())))?;
+    log::info!(
+        "已启动 dsh web（node {} {}，PID {}）",
+        node.display(),
+        bin_js.display(),
+        child.id()
+    );
+    if let Some(out) = child.stdout.take() {
+        thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                log::info!("[dsh] {line}");
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                log::warn!("[dsh] {line}");
+            }
+        });
+    }
+    Ok(child)
+}
+
+/// 生成替换左上角品牌的 CSS：隐藏官方 wordmark 与鱼 logo（均为 svg），
+/// 改为鲸鱼娘图标 + 「小南梁」文字。尺寸对齐原版 24px 高度基准
+/// （图标 24px、文字 17px/600/行高 24px、间距 8px）；图标用 128px 高清
+/// 源图 base64，避免 Retina 下发糊。选择器用 [class*="brand"] 通配，
+/// 避免被编译哈希类名（hHd-Xa_brand）的版本变化影响。
+fn brand_css() -> String {
+    use base64::Engine;
+    let png = include_bytes!("../icons/128x128.png");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    format!(
+        r#"[class*="brand"] svg{{display:none !important}}[class*="brand"]{{display:inline-flex !important;align-items:center !important;gap:8px !important}}[class*="brand"]::before{{content:"";width:40px;height:40px;flex:none;display:inline-block;background:url("data:image/png;base64,{b64}") center/contain no-repeat;border-radius:8px}}[class*="brand"]::after{{content:"小南梁";font-size:17px;font-weight:600;line-height:24px;letter-spacing:.02em;white-space:nowrap}}[class*="railFish"]{{display:none !important}}"#
+    )
+}
+
+/// 导航完成后向 Web GUI 注入品牌样式（脚本自带 DOM 就绪重试）。
+fn inject_brand(app: AppHandle) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let css_json = serde_json::to_string(&brand_css()).unwrap_or_default();
+        let script = format!(
+            "(function(){{var css={css_json};function t(){{if(!document.head)return false;var s=document.getElementById('xiaonanliang-brand');if(!s){{s=document.createElement('style');s.id='xiaonanliang-brand';s.textContent=css;document.head.appendChild(s);}}return true;}}if(!t()){{var i=setInterval(function(){{if(t())clearInterval(i);}},250);setTimeout(function(){{clearInterval(i);}},15000);}}}})();"
+        );
+        if let Some(w) = handle.get_webview_window("main") {
+            if let Err(e) = w.eval(&script) {
+                log::warn!("品牌样式注入失败：{e}");
+            } else {
+                log::info!("小南梁品牌样式已注入（左上角 logo 与名称已替换）");
+            }
+        }
+    });
+}
+
+/// 轮询等待服务就绪，然后把主窗口导航到 Web GUI；失败则跳错误页。
+async fn wait_ready_and_navigate(app: AppHandle, port: u16) {
+    let state = app.state::<DshState>();
+    let url = format!("http://127.0.0.1:{port}/");
+    let deadline = Instant::now() + READY_TIMEOUT;
+    loop {
+        if state.spawn_failed.load(Ordering::SeqCst) {
+            // 错误页已由 setup 按具体原因（not-found / spawn-failed）显示，这里不再二次导航
+            return;
+        }
+        if port_open(port) {
+            if let Some(w) = app.get_webview_window("main") {
+                let script = format!("window.location.replace({url:?});");
+                if let Err(e) = w.eval(&script) {
+                    log::warn!("窗口导航失败：{e}");
+                    show_error(&app, "spawn-failed");
+                    return;
+                }
+                inject_brand(app.clone());
+            }
+            log::info!("本地服务就绪，已导航到 {url}");
+            return;
+        }
+        if Instant::now() >= deadline {
+            log::error!("等待本地服务就绪超时（{}s）", READY_TIMEOUT.as_secs());
+            show_error(&app, "timeout");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// 主窗口跳转到本地错误页并发系统通知。
+fn show_error(app: &AppHandle, reason: &str) {
+    if let Some(w) = app.get_webview_window("main") {
+        let target = format!("error.html?reason={reason}");
+        let _ = w.eval(&format!("window.location.replace({target:?});"));
+    }
+    let body = match reason {
+        "not-found" => "未找到 dsh 命令，请按错误页提示安装。",
+        "spawn-failed" => "dsh 进程启动失败，详见日志。",
+        "timeout" => "等待本地服务就绪超时，详见日志。",
+        _ => "未知错误，详见日志。",
+    };
+    let _ = app
+        .notification()
+        .builder()
+        .title("小南梁 启动失败")
+        .body(body)
+        .show();
+}
+
+/// 显示并聚焦主窗口。
+fn show_main(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// 构建菜单栏托盘：左键显示窗口，菜单提供显示/退出。
+fn build_tray(app: &tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出小南梁", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+    TrayIconBuilder::with_id("dsh-tray")
+        .icon(
+            app.default_window_icon()
+                .expect("缺少应用图标")
+                .clone(),
+        )
+        .tooltip("小南梁")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main(app),
+            "quit" => {
+                app.state::<DshState>().quitting.store(true, Ordering::SeqCst);
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    Target::new(TargetKind::Stdout),
+                    Target::new(TargetKind::LogDir {
+                        file_name: Some("dsh-desktop".into()),
+                    }),
+                ])
+                .level(log::LevelFilter::Info)
+                .build(),
+        )
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }))
+        .manage(DshState {
+            child: Mutex::new(None),
+            spawned_this_run: AtomicBool::new(false),
+            spawn_failed: AtomicBool::new(false),
+            quitting: AtomicBool::new(false),
+            tray_tip_shown: AtomicBool::new(false),
+        })
+        .setup(|app| {
+            let port = app_port();
+            let state = app.state::<DshState>();
+            if port_open(port) {
+                log::info!("127.0.0.1:{port} 已有服务在监听，直接复用现有实例");
+            } else {
+                match spawn_dsh(port) {
+                    Ok(child) => {
+                        log::info!("dsh 子进程已启动（PID {}）", child.id());
+                        *state.child.lock().unwrap() = Some(child);
+                        state.spawned_this_run.store(true, Ordering::SeqCst);
+                    }
+                    Err(SpawnError::NotFound(e)) => {
+                        log::error!("启动 dsh 失败：{e}");
+                        state.spawn_failed.store(true, Ordering::SeqCst);
+                        show_error(app.handle(), "not-found");
+                    }
+                    Err(SpawnError::Other(e)) => {
+                        log::error!("启动 dsh 失败：{e}");
+                        state.spawn_failed.store(true, Ordering::SeqCst);
+                        show_error(app.handle(), "spawn-failed");
+                    }
+                }
+            }
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                wait_ready_and_navigate(handle, port).await;
+            });
+            // 测试钩子：DSH_DESKTOP_AUTO_QUIT=1 时延迟自动退出（模拟托盘退出，验证子进程回收）
+            if std::env::var("DSH_DESKTOP_AUTO_QUIT").as_deref() == Ok("1") {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    log::info!("[auto-quit] 测试钩子触发退出");
+                    handle
+                        .state::<DshState>()
+                        .quitting
+                        .store(true, Ordering::SeqCst);
+                    handle.exit(0);
+                });
+            }
+            build_tray(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.state::<DshState>();
+                if state.quitting.load(Ordering::SeqCst) {
+                    return; // 托盘退出流程：放行关闭
+                }
+                api.prevent_close();
+                let _ = window.hide();
+                if !state.tray_tip_shown.swap(true, Ordering::SeqCst) {
+                    let _ = window
+                        .app_handle()
+                        .notification()
+                        .builder()
+                        .title("小南梁 仍在运行")
+                        .body("窗口已隐藏到菜单栏托盘，点击托盘图标可重新打开；托盘菜单可退出。")
+                        .show();
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            RunEvent::ExitRequested { api, .. } => {
+                let quitting = app.state::<DshState>().quitting.load(Ordering::SeqCst);
+                if !quitting {
+                    api.prevent_exit();
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.hide();
+                    }
+                }
+            }
+            RunEvent::Exit => {
+                let state = app.state::<DshState>();
+                if state.spawned_this_run.load(Ordering::SeqCst) {
+                    if let Some(mut child) = state.child.lock().unwrap().take() {
+                        let pid = child.id();
+                        log::info!("正在停止 dsh 子进程（PID {pid}）");
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        log::info!("dsh 子进程已退出");
+                    }
+                }
+            }
+            _ => {}
+        });
+}
