@@ -827,3 +827,49 @@ pub fn run() {
             _ => {}
         });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_key_parses_semver() {
+        assert_eq!(version_key(std::path::Path::new("v22.12.0")), (22, 12, 0));
+        assert_eq!(version_key(std::path::Path::new("v1.2.3.4")), (1, 2, 3));
+        assert_eq!(version_key(std::path::Path::new("not-a-version")), (0, 0, 0));
+    }
+
+    #[test]
+    fn version_key_orders_correctly() {
+        // 字符串排序会把 v9.11.0 排在 v22.12.0 之后（'9' > '2'），
+        // 这是此前取错"最新版本"的 bug，必须由 semver 键规避。
+        let v9 = version_key(std::path::Path::new("v9.11.0"));
+        let v22 = version_key(std::path::Path::new("v22.12.0"));
+        assert!(v9 < v22, "v9.11.0 应小于 v22.12.0");
+        let v2 = version_key(std::path::Path::new("v2.0.0"));
+        let v10 = version_key(std::path::Path::new("v10.0.0"));
+        assert!(v2 < v10, "v2.0.0 应小于 v10.0.0");
+    }
+
+    #[test]
+    fn random_token_nonempty_and_unique() {
+        let a = random_token();
+        let b = random_token();
+        assert!(!a.is_empty());
+        assert_ne!(a, b, "连续两次生成的 token 不应相同");
+    }
+
+    #[test]
+    fn brand_css_contains_brand_and_icon() {
+        let css = brand_css();
+        assert!(css.contains("小南梁"), "品牌 CSS 应含应用名");
+        assert!(css.contains("data:image/png;base64,"), "品牌 CSS 应内嵌图标");
+        assert!(css.contains("brand"), "应命中品牌选择器");
+    }
+
+    #[test]
+    fn spawn_error_display() {
+        assert_eq!(SpawnError::NotFound("nope".into()).to_string(), "nope");
+        assert_eq!(SpawnError::Other("boom".into()).to_string(), "boom");
+    }
+}

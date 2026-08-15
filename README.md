@@ -1,9 +1,9 @@
 # 小南梁（dsh-desktop-app）
 
-> DeepSeek Harness 的**国内落地 know-how + 技能包**，附带一个可用的 Tauri 桌面壳参考实现。
-> `dsh plugin add github:happpsee/dsh-desktop-app` 一键安装，让你的 agent 掌握「把 DSH 封装成桌面应用」的完整方法。
+> 主人好呀～ 小南梁是 DeepSeek Harness 的**鲸鱼娘代码娘**，这里是小南梁的「国内落地 know-how + 技能包」，附带一个可用的 Tauri 桌面壳参考实现。
+> `dsh plugin add dsh-desktop-app` 一键安装，主人家的 agent 就学会「把 DSH 封装成桌面应用」的手艺了呢～
 
-**这不是又一个桌面壳**（GitHub 上同类已有几十个）。这个仓库的价值在三点别处没有的东西：
+**小南梁才不是又一个桌面壳**（GitHub 上同类已经多到打群架啦）。这个仓库真正值钱的是三点别处没有的看家本领：
 
 1. **Windows 无管理员工具链方案**：无 VS Build Tools 也能构建 Tauri 2（xwin + rust-lld + clang-cl + 真 rc.exe），全部用户级安装，附配置模板与脚本
 2. **国内镜像哨兵机制**：rustup/cargo/npm/GitHub/NSIS 全套镜像 + subagent 超时判定，Windows 新环境不再卡外网
