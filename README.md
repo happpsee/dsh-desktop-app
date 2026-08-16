@@ -32,8 +32,12 @@
 - **单实例**：重复双击聚焦已有窗口，不会拉起第二个服务
 - **窗口状态记忆**：位置与大小自动恢复
 - **品牌注入**：窗口内左上角官方 logo/字标替换为鲸鱼娘 +「小南梁」
-- **任务完成通知**：注入 JS 监听"忙碌→空闲"翻转，任务结束时 Dock 角标 +1；
-  窗口失焦/隐藏时弹系统通知并跳 Dock（前台不打扰），回到窗口自动清零
+- **鲸鱼娘桌宠**：透明置顶无边框小窗，纯 CSS 呼吸/漂浮动画 + 椭圆阴影；拖拽移动
+  （4px 阈值区分点击）、左键唤起主窗、右键菜单（穿透开关/隐藏/退出）、任务完成
+  弹气泡；位置记忆（多屏钳位 + 拖拽防抖）；托盘「显示/隐藏桌宠」开关
+- **任务完成通知**：注入 JS 监听运行中标记（`data-state="ongoing"`）的"忙碌→空闲"
+  翻转，任务结束时 Dock 角标 +1；窗口失焦/隐藏时弹系统通知并跳 Dock（前台不打扰），
+  回到窗口自动清零；通知桥内置 CORS 预检应答（跨源 fetch 不再被浏览器拦截）
 - **健壮定位**：Finder/资源管理器启动的 GUI 应用没有终端 PATH，内置
   nvm/npm-global/npx/Homebrew/非标准盘符等多级兜底探测（Windows 分支用
   `node + bin.js` 直跑，规避 dsh.cmd shim 与黑窗闪现）
@@ -92,7 +96,11 @@ cp -r skill ~/.claude/skills/dsh-desktop-app   # Claude Code / Claude Agent
 
 ## 已知限制
 
-- Web GUI 内的系统通知（如任务完成）尚未接入桌面通知通道
 - 品牌注入在窗口内手动刷新（Cmd+R）后会丢失，重开窗口恢复
+- 任务完成通知仍为 DOM 启发式（`data-state` 运行中标记），分不清成功/失败/被停、
+  拿不到标题/token；权威信号 `turn/end` 的语义化升级方案见 docs/next-tasks.md
+- 桌宠：macOS 打包（DMG）后透明可能丢失（tauri issue #13415，dev 正常，需真机双验）；
+  macOS 置顶仅 Floating 级、盖不过全屏应用；macOS Cmd+Tab 会出现桌宠条目
+  （`skipTaskbar` 仅 Windows 生效）；任务通知首次弹出需在系统设置授予通知权限
 - 未签名分发：Windows 网络下载的 exe 会触发 SmartScreen 提示（本地构建不触发）；
   macOS 非公证 app 需右键打开
