@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.4.0"
+version = "0.4.1"
 description = "小南梁 —— DeepSeek Harness 桌面客户端（一键启动本地服务并托盘常驻）"
 authors = ["ArcReel"]
 edition = "2021"
