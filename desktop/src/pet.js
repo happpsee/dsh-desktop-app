@@ -4,36 +4,6 @@ const { listen } = window.__TAURI__.event;
 const { getCurrentWindow } = window.__TAURI__.window;
 const win = getCurrentWindow();
 
-// ---- 表情帧（眨眼 + 开心）----
-// pet.png = 睁眼（默认）、pet-blink-half/closed = 眨眼帧、pet-happy = 任务完成开心
-const sprite = document.getElementById('sprite');
-const FACES = {
-  open: 'pet.png',
-  half: 'pet-blink-half.png',
-  closed: 'pet-blink-closed.png',
-  happy: 'pet-happy.png',
-};
-Object.values(FACES).forEach((f) => {
-  const im = new Image();
-  im.src = f; // 预加载，避免眨眼时闪白
-});
-let happyUntil = 0; // 开心表情持续到的时刻戳；期间不眨眼
-
-function setFace(face) {
-  if (Date.now() < happyUntil && face !== 'happy') return;
-  sprite.src = FACES[face];
-}
-
-// 眨眼：约 5s 一次，睁 → 半闭 → 闭 → 半闭 → 睁（约 270ms）
-function blink() {
-  if (Date.now() < happyUntil) return;
-  setFace('half');
-  setTimeout(() => setFace('closed'), 90);
-  setTimeout(() => setFace('half'), 180);
-  setTimeout(() => setFace('open'), 270);
-}
-setInterval(blink, 5000);
-
 // ---- 拖拽 vs 点击判定 ----
 const stage = document.getElementById('stage');
 let startX = 0;
@@ -100,13 +70,9 @@ async function initBubble() {
   await listen('pet-say', (e) => {
     bubbleText.textContent = e.payload?.body || '任务完成啦～';
     bubble.hidden = false;
-    happyUntil = Date.now() + 5000; // 开心表情持续到气泡收起
-    setFace('happy');
     clearTimeout(bubbleTimer);
     bubbleTimer = setTimeout(() => {
       bubble.hidden = true;
-      happyUntil = 0;
-      setFace('open');
     }, 5000);
   });
 }
