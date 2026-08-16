@@ -97,3 +97,42 @@ pnpm tauri build                              # 打包（产物在 src-tauri/tar
 3. git commit（Conventional Commits）+ push
 4. 更新 `TODO.md` 勾掉对应项；若 mac 产物重打包，更新 `/Applications/小南梁.app`
 5. 向主人汇报：改了什么、怎么验证、产物在哪
+
+---
+
+## 五、任务通知语义化升级（0.4.0 之后的下一跳）
+
+> 背景：0.4.0 已把通知从"扫文案"升级为 `data-state="ongoing"` 标记，但仍是 DOM 启发式，
+> 分不清成功/失败/被停/超限，也拿不到标题/token/耗时。**DSH 有权威信号**：会话事件日志的
+> `turn/end` 事件，`reason` 分六种（completed / aborted{user|parent|hook|disposed} /
+> error{LlmFailure} / max-tokens / interrupted / blocked），发射点在 agent loop 的
+> `finally` 块（`dsh-agent-loop/lib/index.js:592`），任何结局都会写。
+
+### 首选方案：Host 插件订阅 `session/event`（`dsh web --patch` 注入）
+
+- 官方订阅 API：`ctx.on("session/event", (session, event) => …)`（与
+  dsh-session-persistence/telemetry 同款写法），`session.header` 带
+  `{id, cwd, agentPreset, delegationDepth}`（用 `delegationDepth==0` 过滤 subagent 噪音）。
+- `dsh web --patch <file>` 是官方叠加层；patch yml 的 `insert.id` + `name`（绝对路径 JS）
+  即可挂一个 host 插件，插件里组装 `{turn, reason, title, usage, elapsedMs, sessionId}`
+  → POST 现有本地 HTTP 桥（扩协议）→ Rust 按 `(sessionId, turn)` 去重 + 按 reason 渲染文案。
+- 完整插件 JS、Rust 去重/渲染代码片段见 2026-08-16 会话「任务通知重设计」子代理报告。
+
+### 兜底：Rust tail `session.jsonl.zstd`（复用已有 dsh 实例时 --patch 不生效）
+
+- 文件 = header 帧 + 每批事件一个独立 zstd 帧（带 checksum，magic `0x28B52FFD`），
+  追加写 + fsync，批延迟 ≤200ms；Rust 加 `zstd` crate，每 500ms 扫帧解码新行，
+  过滤 `type=="turn/end"`，走同一 dedupe/渲染链路；按 header.cwd 过滤项目。
+- 私有格式依赖：header 带 `version:0` + invariant 校验，较稳定；DSH 升级改格式时
+  校验 version 不匹配即停用回退 DOM。
+
+### 语义增强（可选）
+
+- 订阅 `goal/change {operation:"complete"}` 把通知升级为"目标已完成"（仅长目标任务出现）。
+
+### 插件市场机会（已盘点，见 docs/plugin-market-desktop-opportunities.md）
+
+按性价比前 5：① 审批/提问/异常 → 系统通知+点击聚焦（P0）；② 截图/剪贴板 → 视觉理解
+（P0，profile 已装 dsh-vision-router）；③ 托盘升级为状态中心（P1）；④ 预定任务消化通知+
+防睡眠（P1）；⑤ 小南梁通知气泡（P1，0.4.0 桌宠已含气泡雏形）。明确排除：内置插件市场 UI
+（安全责任）、IM 桥、模型路由、LAN/远程网关、完整 computer-use。

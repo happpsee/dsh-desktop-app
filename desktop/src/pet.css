@@ -1,0 +1,139 @@
+html,
+body {
+  background: transparent !important; /* 透明窗口：body 必须透明 */
+  margin: 0;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+#pet-root {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+}
+
+#stage {
+  position: absolute;
+  inset: 0;
+}
+
+#sprite {
+  position: absolute;
+  bottom: 18px;
+  left: 50%;
+  transform: translateX(-50%);
+  height: 220px;
+  pointer-events: none; /* 事件统一交给 stage 容器判定 */
+  animation:
+    float 5s ease-in-out infinite,
+    breathe 3.4s ease-in-out infinite;
+}
+
+@keyframes float {
+  0%,
+  100% {
+    transform: translateX(-50%) translateY(0);
+  }
+  50% {
+    transform: translateX(-50%) translateY(-7px);
+  }
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    scale: 1 1;
+  }
+  50% {
+    scale: 1.02 0.985;
+  }
+}
+
+#shadow {
+  position: absolute;
+  bottom: 8px;
+  left: 50%;
+  width: 90px;
+  height: 16px;
+  margin-left: -45px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.28);
+  filter: blur(6px);
+  animation: shadowSync 5s ease-in-out infinite;
+}
+
+@keyframes shadowSync {
+  0%,
+  100% {
+    transform: scaleX(1);
+    opacity: 0.85;
+  }
+  50% {
+    transform: scaleX(0.92);
+    opacity: 0.6;
+  }
+}
+
+#bubble {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  right: 8px;
+  background: rgba(15, 17, 21, 0.92);
+  color: #e6e8eb;
+  border-radius: 14px;
+  padding: 10px 12px;
+  font:
+    13px/1.5 -apple-system,
+    "PingFang SC",
+    "Segoe UI",
+    sans-serif;
+  animation: bubbleIn 0.25s ease-out;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+@keyframes bubbleIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+#menu {
+  position: absolute;
+  top: 4px;
+  left: 4px;
+  z-index: 10;
+  background: rgba(15, 17, 21, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 4px;
+  font:
+    13px/1.6 -apple-system,
+    "PingFang SC",
+    "Segoe UI",
+    sans-serif;
+  color: #e6e8eb;
+}
+
+#menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 6px 14px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+#menu button:hover {
+  background: rgba(77, 124, 254, 0.25);
+}

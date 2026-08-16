@@ -275,7 +275,8 @@ icons/ + src/main.rs + src/lib.rs），`pnpm install` 后即可 `pnpm tauri buil
 ## 四、Rust 核心（src-tauri/）
 
 直接用 `resources/` 里的 `Cargo.toml`、`tauri.conf.json`、`capabilities.json`（改名
-capabilities/default.json）覆盖脚手架文件，lib.rs 用 `resources/lib.rs` 全文覆盖。
+capabilities/default.json）、`capabilities-pet.json`（改名 capabilities/pet.json）
+覆盖脚手架文件，lib.rs 用 `resources/lib.rs` 全文覆盖。
 注意：中文 productName（小南梁）下 tauri.conf.json **必须**含
 `"bundle": {"windows": {"wix": {"language": "zh-CN"}}}`，否则 Windows MSI 打包
 light.exe 报 LGHT0311（codepage 1252 编不了中文）必失败；resources/tauri.conf.json
@@ -306,12 +307,26 @@ light.exe 报 LGHT0311（codepage 1252 编不了中文）必失败；resources/t
     直跑 node 仍推荐——少一层 cmd 包装、输出转发直接）；nvm-windows 在
     %NVM_HOME%\v*\、%NVM_SYMLINK%\、%APPDATA%\nvm；`.creation_flags(0x0800_0000)`
     防闪黑窗
-- **托盘**：TrayIconBuilder，tooltip「小南梁」，菜单「显示主窗口/退出小南梁」，
-  左键显示；**关闭即隐藏**（CloseRequested prevent + hide，首次通知提示），
+- **托盘**：TrayIconBuilder，tooltip「小南梁」，菜单「显示主窗口/显示或隐藏桌宠/
+  退出小南梁」，左键显示；**关闭即隐藏**（CloseRequested prevent + hide，首次通知提示），
   ExitRequested 非 quitting 拦截 Cmd+Q；**退出回收**：托盘退出置 quitting →
   app.exit(0) → RunEvent::Exit 里仅当 spawned_this_run 时 kill + wait
-- **插件顺序**：log（Stdout + LogDir "dsh-desktop"）、notification、window-state、
+- **插件顺序**：log（Stdout + LogDir "dsh-desktop"）、notification、window-state
+  （`with_denylist(["pet"])` 排除桌宠，否则插件会接管桌宠位置）、
   single-instance（回调 show + focus）
+- **任务完成通知**：本地 HTTP 桥（127.0.0.1 随机端口 + Bearer token）接收注入脚本
+  POST /notify；桥必须回 OPTIONS + Access-Control-Allow-* 头（跨源 preflight 被拦是
+  0.3.0 通知失效的根因）；注入脚本在**导航完成后**注入（勿在 setup 提前注入，冷启动
+  会随加载页销毁），busy 检测用 `[data-state="ongoing"]`（编译产物实测标记，勿扫
+  "停止"文案——那是运行时 i18n，bundle 里 0 次）
+- **桌宠**：tauri.conf.json 第二窗口 pet（transparent + decorations:false +
+  alwaysOnTop + skipTaskbar + focusable:false + visible:false + acceptFirstMouse +
+  visibleOnAllWorkspaces）；macOS 透明需 `macOSPrivateApi:true` + Cargo.toml
+  `macos-private-api` feature（缺了 build 报错）；位置存 app_config_dir/pet.json
+  （多屏钳位 + WindowEvent::Moved 400ms 防抖）；自定义命令 pet_show_main / pet_hide /
+  pet_quit / pet_toggle_passthrough 经 invoke_handler 注册（应用命令免 ACL）；桌宠
+  前端 pet.html/css/js 用 `window.__TAURI__`（需 `withGlobalTauri:true`），拖拽走
+  JS 手动 `startDragging`（4px 阈值区分点击，需 `core:window:allow-start-dragging`）
 - **测试钩子**：env `DSH_DESKTOP_AUTO_QUIT=1` 时 setup 后 8 秒自动走退出流程（验收用）
 
 应用名/文案按需替换「小南梁」（tauri.conf.json 的 productName、窗口 title、lib.rs

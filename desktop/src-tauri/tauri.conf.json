@@ -1,13 +1,14 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "小南梁",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "identifier": "com.arcreel.dsh-desktop",
   "build": {
     "frontendDist": "../src"
   },
   "app": {
-    "withGlobalTauri": false,
+    "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
@@ -17,6 +18,27 @@
         "minWidth": 940,
         "minHeight": 620,
         "center": true,
+        "dragDropEnabled": false
+      },
+      {
+        "label": "pet",
+        "url": "pet.html",
+        "title": "小南梁桌宠",
+        "width": 260,
+        "height": 300,
+        "resizable": false,
+        "maximizable": false,
+        "minimizable": false,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focusable": false,
+        "focus": false,
+        "shadow": false,
+        "visible": false,
+        "acceptFirstMouse": true,
+        "visibleOnAllWorkspaces": true,
         "dragDropEnabled": false
       }
     ],

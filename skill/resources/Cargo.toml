@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.3.0"
+version = "0.4.0"
 description = "小南梁 —— DeepSeek Harness 桌面客户端（一键启动本地服务并托盘常驻）"
 authors = ["ArcReel"]
 edition = "2021"
@@ -16,7 +16,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
 tauri-plugin-log = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"

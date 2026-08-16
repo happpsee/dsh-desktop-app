@@ -22,7 +22,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Manager, RunEvent, WindowEvent,
+    AppHandle, Emitter, Manager, RunEvent, WindowEvent,
 };
 use tauri_plugin_log::{Target, TargetKind};
 use tauri_plugin_notification::NotificationExt;
@@ -85,6 +85,8 @@ struct DshState {
     tray_tip_shown: AtomicBool,
     /// 未读任务完成数（Dock 角标）。
     unread: AtomicU32,
+    /// 桌宠上次落盘位置的时间（Moved 事件 400ms 防抖）。
+    pet_save_at: Mutex<Option<Instant>>,
 }
 
 /// 定位 dsh 可执行文件。
@@ -479,7 +481,16 @@ fn start_notify_server(app: AppHandle) -> (u16, String) {
     (port, token)
 }
 
-/// 处理单条通知连接：校验 Bearer token，解析 JSON body，触发通知。
+/// CORS 响应头：注入脚本从 `127.0.0.1:3080` 跨源 fetch 到本桥（随机端口），
+/// `Content-Type: application/json` + `Authorization` 头会触发浏览器 preflight；
+/// 不回 OPTIONS 与 `Access-Control-Allow-*` 头，浏览器会直接拦截实际请求
+/// （0.3.0 任务通知"收不到"的根因之一）。
+const CORS_HEADERS: &str = "Access-Control-Allow-Origin: *\r\n\
+Access-Control-Allow-Methods: POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+Access-Control-Max-Age: 86400\r\n";
+
+/// 处理单条通知连接：先应答 CORS 预检，再校验 Bearer token、解析 JSON body、触发通知。
 async fn handle_notify_conn(sock: &mut tokio::net::TcpStream, app: &AppHandle, token: &str) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = [0u8; 4096];
@@ -488,6 +499,16 @@ async fn handle_notify_conn(sock: &mut tokio::net::TcpStream, app: &AppHandle, t
         _ => return,
     };
     let req = String::from_utf8_lossy(&buf[..n]).to_string();
+    // 预检 OPTIONS 不带 body、不校验 token，回 204 + CORS 头后由浏览器发起正式 POST。
+    if req.starts_with("OPTIONS ") {
+        let _ = sock
+            .write_all(
+                format!("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n{CORS_HEADERS}\r\n")
+                    .as_bytes(),
+            )
+            .await;
+        return;
+    }
     if !req.contains(&format!("Bearer {token}")) {
         let _ = sock
             .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
@@ -503,7 +524,10 @@ async fn handle_notify_conn(sock: &mut tokio::net::TcpStream, app: &AppHandle, t
     }
     notify_completed(app, &msg);
     let _ = sock
-        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        .write_all(
+            format!("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n{CORS_HEADERS}\r\n")
+                .as_bytes(),
+        )
         .await;
 }
 
@@ -531,6 +555,12 @@ fn notify_completed(app: &AppHandle, body: &str) {
             let _ = w.request_user_attention(Some(tauri::UserAttentionType::Informational));
         }
     }
+    // 桌宠气泡：可见时推送 pet-say 事件（前端气泡 5s 自动收起）
+    if let Some(pet) = app.get_webview_window("pet") {
+        if pet.is_visible().unwrap_or(false) {
+            let _ = app.emit("pet-say", serde_json::json!({ "body": body }));
+        }
+    }
     log::info!("任务完成通知：{}（未读 {unread}，失焦={distracted}）", body);
 }
 
@@ -544,11 +574,9 @@ fn task_notifier_script(port: u16, token: &str) -> String {
   var wasBusy = false, lastFire = 0;
   function isBusy(){
     try {
-      var els = document.querySelectorAll('button,[role="button"]');
-      for (var i=0;i<els.length;i++){
-        var t = (els[i].textContent||'').replace(/\s+/g,'');
-        if (t.indexOf('停止')===0 || /^stop/i.test(t)) return true;
-      }
+      // 运行中标记：GUI 的加载 spinner 用 data-state="ongoing"（编译产物实测存在；
+      // 旧的"停止"是运行时 i18n 文案，bundle 里 0 次，永远判不出忙碌）
+      if (document.querySelector('[data-state="ongoing"]')) return true;
       if (document.querySelector('[aria-busy="true"]')) return true;
     } catch(e){}
     return false;
@@ -596,7 +624,8 @@ fn inject_task_notifier(app: AppHandle, port: u16, token: &str) {
 }
 
 /// 轮询等待服务就绪，然后把主窗口导航到 Web GUI；失败则跳错误页。
-async fn wait_ready_and_navigate(app: AppHandle, port: u16) {
+/// `nport`/`ntoken` 是通知桥的端口与令牌，导航完成后才注入监听脚本。
+async fn wait_ready_and_navigate(app: AppHandle, port: u16, nport: u16, ntoken: String) {
     let state = app.state::<DshState>();
     let url = format!("http://127.0.0.1:{port}/");
     let deadline = Instant::now() + READY_TIMEOUT;
@@ -614,6 +643,9 @@ async fn wait_ready_and_navigate(app: AppHandle, port: u16) {
                     return;
                 }
                 inject_brand(app.clone());
+                // 导航后注入监听：0.3.0 在 setup 阶段提前注入，冷启动时脚本
+                // 落在加载页、随导航销毁（通知收不到的根因之二）。
+                inject_task_notifier(app.clone(), nport, &ntoken);
             }
             log::info!("本地服务就绪，已导航到 {url}");
             return;
@@ -656,11 +688,137 @@ fn show_main(app: &AppHandle) {
     }
 }
 
-/// 构建菜单栏托盘：左键显示窗口，菜单提供显示/退出。
+// ==================== 桌宠（透明置顶小窗） ====================
+
+/// 桌宠窗口尺寸（物理像素），与 tauri.conf.json 中 pet 窗口 width/height 一致，
+/// 用于载入位置时的多屏钳位。
+const PET_W: i32 = 260;
+const PET_H: i32 = 300;
+
+/// 桌宠持久化状态（存 app_config_dir/pet.json，物理像素坐标）。
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct PetState {
+    x: i32,
+    y: i32,
+    enabled: bool,
+    passthrough: bool,
+}
+
+fn pet_state_path(app: &AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("pet.json"))
+}
+
+fn read_pet_state(app: &AppHandle) -> PetState {
+    let Some(path) = pet_state_path(app) else {
+        return PetState::default();
+    };
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_pet_state(app: &AppHandle, st: &PetState) {
+    let Some(path) = pet_state_path(app) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(st) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// 载入坐标钳位到可见显示器；全都不在（如拔了外接屏）则回退主屏右下角。
+fn clamp_pet_to_monitors(pet: &tauri::WebviewWindow, x: i32, y: i32) -> (i32, i32) {
+    if let Ok(monitors) = pet.available_monitors() {
+        for m in &monitors {
+            let wa = m.work_area();
+            let (wx, wy) = (wa.position.x, wa.position.y);
+            let (ww, wh) = (wa.size.width as i32, wa.size.height as i32);
+            if x >= wx && x + PET_W <= wx + ww && y >= wy && y + PET_H <= wy + wh {
+                return (x, y);
+            }
+        }
+    }
+    if let Ok(Some(m)) = pet.primary_monitor() {
+        let wa = m.work_area();
+        let (wx, wy) = (wa.position.x, wa.position.y);
+        let (ww, wh) = (wa.size.width as i32, wa.size.height as i32);
+        return (wx + ww - PET_W - 16, wy + wh - PET_H - 16);
+    }
+    (x, y)
+}
+
+/// 启动时恢复桌宠位置与可见性（窗口由 tauri.conf.json 声明自动创建）。
+fn setup_pet(app: &AppHandle) {
+    let Some(pet) = app.get_webview_window("pet") else {
+        return;
+    };
+    let st = read_pet_state(app);
+    let (cx, cy) = clamp_pet_to_monitors(&pet, st.x, st.y);
+    let _ = pet.set_position(tauri::PhysicalPosition::new(cx, cy));
+    if st.passthrough {
+        let _ = pet.set_ignore_cursor_events(true);
+    }
+    if st.enabled {
+        let _ = pet.show();
+    }
+}
+
+/// 显示/隐藏桌宠（托盘与右键共用），并写回 enabled 状态。
+fn toggle_pet(app: &AppHandle) {
+    let Some(pet) = app.get_webview_window("pet") else {
+        return;
+    };
+    let mut st = read_pet_state(app);
+    if pet.is_visible().unwrap_or(false) {
+        let _ = pet.hide();
+        st.enabled = false;
+    } else {
+        let _ = pet.show();
+        st.enabled = true;
+    }
+    write_pet_state(app, &st);
+}
+
+#[tauri::command]
+fn pet_show_main(app: AppHandle) {
+    show_main(&app);
+}
+
+#[tauri::command]
+fn pet_hide(app: AppHandle) {
+    if let Some(pet) = app.get_webview_window("pet") {
+        let _ = pet.hide();
+    }
+    let mut st = read_pet_state(&app);
+    st.enabled = false;
+    write_pet_state(&app, &st);
+}
+
+#[tauri::command]
+fn pet_quit(app: AppHandle) {
+    app.state::<DshState>().quitting.store(true, Ordering::SeqCst);
+    app.exit(0);
+}
+
+#[tauri::command]
+fn pet_toggle_passthrough(app: AppHandle) -> bool {
+    let mut st = read_pet_state(&app);
+    st.passthrough = !st.passthrough;
+    if let Some(pet) = app.get_webview_window("pet") {
+        let _ = pet.set_ignore_cursor_events(st.passthrough);
+    }
+    write_pet_state(&app, &st);
+    st.passthrough
+}
+
+/// 构建菜单栏托盘：左键显示窗口，菜单提供显示/隐藏桌宠/退出。
 fn build_tray(app: &tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let pet = MenuItem::with_id(app, "pet", "显示/隐藏桌宠", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出小南梁", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &quit])?;
+    let menu = Menu::with_items(app, &[&show, &pet, &quit])?;
     TrayIconBuilder::with_id("dsh-tray")
         .icon(
             app.default_window_icon()
@@ -672,6 +830,7 @@ fn build_tray(app: &tauri::App) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "show" => show_main(app),
+            "pet" => toggle_pet(app),
             "quit" => {
                 app.state::<DshState>().quitting.store(true, Ordering::SeqCst);
                 app.exit(0);
@@ -707,10 +866,20 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_denylist(&["pet"])
+                .build(),
+        )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main(app);
         }))
+        .invoke_handler(tauri::generate_handler![
+            pet_show_main,
+            pet_hide,
+            pet_quit,
+            pet_toggle_passthrough
+        ])
         .manage(DshState {
             child: Mutex::new(None),
             spawned_this_run: AtomicBool::new(false),
@@ -718,6 +887,7 @@ pub fn run() {
             quitting: AtomicBool::new(false),
             tray_tip_shown: AtomicBool::new(false),
             unread: AtomicU32::new(0),
+            pet_save_at: Mutex::new(None),
         })
         .setup(|app| {
             let port = app_port();
@@ -743,9 +913,13 @@ pub fn run() {
                     }
                 }
             }
+            // 先起通知桥，把端口/token 交给导航任务；导航完成后再注入监听脚本
+            //（0.3.0 在导航前注入，冷启动时脚本随加载页销毁）。
+            let (nport, ntoken) = start_notify_server(app.handle().clone());
             let handle = app.handle().clone();
+            let nav_token = ntoken.clone();
             tauri::async_runtime::spawn(async move {
-                wait_ready_and_navigate(handle, port).await;
+                wait_ready_and_navigate(handle, port, nport, nav_token).await;
             });
             // 测试钩子：DSH_DESKTOP_AUTO_QUIT=1 时延迟自动退出（模拟托盘退出，验证子进程回收）
             if std::env::var("DSH_DESKTOP_AUTO_QUIT").as_deref() == Ok("1") {
@@ -768,36 +942,70 @@ pub fn run() {
                     notify_completed(&handle, "这是测试通知：任务完成链路验证");
                 });
             }
-            let (nport, ntoken) = start_notify_server(app.handle().clone());
-            inject_task_notifier(app.handle().clone(), nport, &ntoken);
             build_tray(app)?;
+            setup_pet(app.handle());
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() != "main" {
-                return;
-            }
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                let state = window.state::<DshState>();
-                if state.quitting.load(Ordering::SeqCst) {
-                    return; // 托盘退出流程：放行关闭
+            match window.label() {
+                "pet" => match event {
+                    WindowEvent::CloseRequested { api, .. } => {
+                        // 桌宠不退出，只隐藏（退出走托盘/右键 pet_quit）
+                        api.prevent_close();
+                        let _ = window.hide();
+                        let mut st = read_pet_state(window.app_handle());
+                        st.enabled = false;
+                        write_pet_state(window.app_handle(), &st);
+                    }
+                    WindowEvent::Moved(pos) => {
+                        // 拖拽结束才落盘位置（400ms 防抖，避免拖动期间高频写盘）
+                        let app = window.app_handle();
+                        let state = app.state::<DshState>();
+                        let now = Instant::now();
+                        let should_save = state
+                            .pet_save_at
+                            .lock()
+                            .map(|last| {
+                                last.map_or(true, |t| now.duration_since(t) >= Duration::from_millis(400))
+                            })
+                            .unwrap_or(true);
+                        if should_save {
+                            let mut st = read_pet_state(&app);
+                            st.x = pos.x;
+                            st.y = pos.y;
+                            write_pet_state(&app, &st);
+                            if let Ok(mut last) = state.pet_save_at.lock() {
+                                *last = Some(now);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                "main" => {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        let state = window.state::<DshState>();
+                        if state.quitting.load(Ordering::SeqCst) {
+                            return; // 托盘退出流程：放行关闭
+                        }
+                        api.prevent_close();
+                        let _ = window.hide();
+                        if !state.tray_tip_shown.swap(true, Ordering::SeqCst) {
+                            let _ = window
+                                .app_handle()
+                                .notification()
+                                .builder()
+                                .title("小南梁 仍在运行")
+                                .body("窗口已隐藏到菜单栏托盘，点击托盘图标可重新打开；托盘菜单可退出。")
+                                .show();
+                        }
+                    } else if let WindowEvent::Focused(true) = event {
+                        // 用户回到窗口：清零角标与未读数
+                        let state = window.state::<DshState>();
+                        state.unread.store(0, Ordering::SeqCst);
+                        let _ = window.set_badge_count(None);
+                    }
                 }
-                api.prevent_close();
-                let _ = window.hide();
-                if !state.tray_tip_shown.swap(true, Ordering::SeqCst) {
-                    let _ = window
-                        .app_handle()
-                        .notification()
-                        .builder()
-                        .title("小南梁 仍在运行")
-                        .body("窗口已隐藏到菜单栏托盘，点击托盘图标可重新打开；托盘菜单可退出。")
-                        .show();
-                }
-            } else if let WindowEvent::Focused(true) = event {
-                // 用户回到窗口：清零角标与未读数
-                let state = window.state::<DshState>();
-                state.unread.store(0, Ordering::SeqCst);
-                let _ = window.set_badge_count(None);
+                _ => {}
             }
         })
         .build(tauri::generate_context!())
@@ -826,4 +1034,50 @@ pub fn run() {
             }
             _ => {}
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_key_parses_semver() {
+        assert_eq!(version_key(std::path::Path::new("v22.12.0")), (22, 12, 0));
+        assert_eq!(version_key(std::path::Path::new("v1.2.3.4")), (1, 2, 3));
+        assert_eq!(version_key(std::path::Path::new("not-a-version")), (0, 0, 0));
+    }
+
+    #[test]
+    fn version_key_orders_correctly() {
+        // 字符串排序会把 v9.11.0 排在 v22.12.0 之后（'9' > '2'），
+        // 这是此前取错"最新版本"的 bug，必须由 semver 键规避。
+        let v9 = version_key(std::path::Path::new("v9.11.0"));
+        let v22 = version_key(std::path::Path::new("v22.12.0"));
+        assert!(v9 < v22, "v9.11.0 应小于 v22.12.0");
+        let v2 = version_key(std::path::Path::new("v2.0.0"));
+        let v10 = version_key(std::path::Path::new("v10.0.0"));
+        assert!(v2 < v10, "v2.0.0 应小于 v10.0.0");
+    }
+
+    #[test]
+    fn random_token_nonempty_and_unique() {
+        let a = random_token();
+        let b = random_token();
+        assert!(!a.is_empty());
+        assert_ne!(a, b, "连续两次生成的 token 不应相同");
+    }
+
+    #[test]
+    fn brand_css_contains_brand_and_icon() {
+        let css = brand_css();
+        assert!(css.contains("小南梁"), "品牌 CSS 应含应用名");
+        assert!(css.contains("data:image/png;base64,"), "品牌 CSS 应内嵌图标");
+        assert!(css.contains("brand"), "应命中品牌选择器");
+    }
+
+    #[test]
+    fn spawn_error_display() {
+        assert_eq!(SpawnError::NotFound("nope".into()).to_string(), "nope");
+        assert_eq!(SpawnError::Other("boom".into()).to_string(), "boom");
+    }
 }

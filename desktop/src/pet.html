@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>小南梁桌宠</title>
+    <link rel="stylesheet" href="pet.css" />
+  </head>
+  <body>
+    <div id="pet-root">
+      <div id="bubble" data-tauri-drag-region="false" hidden>
+        <span id="bubble-text"></span>
+      </div>
+      <div id="stage">
+        <img id="sprite" src="pet.png" draggable="false" alt="小南梁" />
+        <div id="shadow"></div>
+      </div>
+      <div id="menu" data-tauri-drag-region="false" hidden>
+        <button data-act="show-main">显示主窗口</button>
+        <button data-act="toggle-passthrough">鼠标穿透：开/关</button>
+        <button data-act="hide">隐藏桌宠</button>
+        <button data-act="quit">退出小南梁</button>
+      </div>
+    </div>
+    <script src="pet.js"></script>
+  </body>
+</html>
